@@ -78,5 +78,5 @@ class BootstrapServersDiscoveryStrategy(SubCommunityDiscoveryStrategy):
         target_peers: int = 20,
         discovery_params: Dict[str, Any] = None,
     ) -> None:
-        for k in self.get_bootstrap_servers(subcom.subcom_id):
+        for k in self.get_bootstrap_servers(subcom.cs_id):
             subcom.walk_to(k)

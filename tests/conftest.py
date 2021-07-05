@@ -1,22 +1,19 @@
 # tests/conftest.py
 import collections
-from typing import Any, List, Union
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
-import pytest
 from _pytest.config import Config
-
+from bami.backbone.payload import payload
+from bami.backbone.transaction import Operation, OperationsManager, Transaction
+from bami.backbone.utils import GEN_LINK
+from bami.datastore.chain_store import BaseChain, Chain
+from bami.datastore.database import BaseDB
+from bami.sync.data_models import Link
+from bami.sync.peer_state import CellIndexer
 from ipv8.keyvault.crypto import default_eccrypto
-from ipv8.keyvault.private.libnaclkey import LibNaCLSK
+import pytest
 
-from bami.backbone.block import EMPTY_SIG, BamiBlock
-from bami.backbone.datastore.chain_store import BaseChain, Chain
-from bami.backbone.datastore.database import BaseDB
-from bami.backbone.utils import (
-    encode_links,
-    encode_raw,
-    GENESIS_LINK,
-    Links,
-)
 from tests.mocking.base import (
     create_and_connect_nodes,
     SetupValues,
@@ -28,82 +25,47 @@ def pytest_configure(config: Config) -> None:
     config.addinivalue_line("markers", "e2e: mark as end-to-end test.")
 
 
-# Fixtures
-class FakeBlock(BamiBlock):
-    """
-    Test Block that simulates a block used in TrustChain.
-    Also used in other test files for TrustChain.
-    """
-
-    def __init__(
-        self,
-        transaction: bytes = None,
-        previous: Links = None,
-        key: LibNaCLSK = None,
-        links: Links = None,
-        com_prefix: bytes = b"",
-        com_id: Any = None,
-        block_type: bytes = b"test",
-    ):
-        crypto = default_eccrypto
-        if not links:
-            links = GENESIS_LINK
-            com_seq_num = 1
-        else:
-            com_seq_num = max(links)[0] + 1
-
-        if not previous:
-            previous = GENESIS_LINK
-        pers_seq_num = max(previous)[0] + 1
-
-        if not com_id:
-            com_id = crypto.generate_key("curve25519").pub().key_to_bin()
-
-        if key:
-            self.key = key
-        else:
-            self.key = crypto.generate_key("curve25519")
-
-        if not transaction:
-            transaction = encode_raw({"id": 42})
-
-        BamiBlock.__init__(
-            self,
-            (
-                block_type,
-                transaction,
-                self.key.pub().key_to_bin(),
-                pers_seq_num,
-                encode_links(previous),
-                encode_links(links),
-                com_prefix,
-                com_id,
-                com_seq_num,
-                EMPTY_SIG,
-                0,
-                0,
-            ),
-        )
-        self.sign(self.key)
+test_key = default_eccrypto.generate_key("curve25519")
 
 
-def create_block_batch(com_id, num_blocks=100):
-    """
-    Create a given amount of blocks. Each block points to the previous one.
+@pytest.fixture
+def common_test_key():
+    return test_key
 
-    Args:
-        com_id: The community identifier of the block batch.
-        num_blocks: The number of blocks to create.
 
-    Returns: A list with blocks.
+@payload
+@dataclass
+class MockOperation(Operation):
+    value: int
 
-    """
+
+def prepare_params(seed: bytes = b"0"):
+    return [
+        test_key.pub().key_to_bin(),
+        b"test_state" * 2,
+        [GEN_LINK],
+        [MockOperation(b"test_key", [GEN_LINK], seed, 1)],
+    ]
+
+
+@pytest.fixture()
+def test_params():
+    OperationsManager.register_class(MockOperation)
+    return prepare_params()
+
+
+def create_block_batch(num_blocks=100, seed_val: bytes = b""):
+    OperationsManager.register_class(MockOperation)
     blocks = []
-    last_block_point = GENESIS_LINK
+    last_block_point = CellIndexer.create_cell_array()
+    last_link = GEN_LINK
     for k in range(num_blocks):
-        blk = FakeBlock(com_id=com_id, links=last_block_point, transaction=None)
-        blocks.append(blk)
-        last_block_point = Links(((blk.com_seq_num, blk.short_hash),))
+        params = prepare_params(seed_val)
+        params[2] = [last_link]
+        tx = Transaction(*params)
+        blocks.append(tx)
+        last_block_point[CellIndexer.cell_id(hash(tx))] += 1
+        last_link = Link(sum(last_block_point), tx.short_hash)
     return blocks
 
 
@@ -111,65 +73,60 @@ def create_block_batch(com_id, num_blocks=100):
 def create_batches():
     def _create_batches(num_batches=2, num_blocks=100):
         """
-        Creates batches of blocks within a random community.
+        Creates batches of transactions within a random community.
 
         Args:
             num_batches: The number of batches to consider.
-            num_blocks: The number of blocks in each batch.
+            num_blocks: The number of transactions in each batch.
 
-        Returns: A list of batches where each batch represents a chain of blocks.
+        Returns: A list of batches where each batch represents a chain of transactions.
 
         """
-        key = default_eccrypto.generate_key("curve25519")
-        com_id = key.pub().key_to_bin()
-        return [create_block_batch(com_id, num_blocks) for _ in range(num_batches)]
+        return [
+            create_block_batch(num_blocks, i.to_bytes(4, "big"))
+            for i in range(num_batches)
+        ]
 
     return _create_batches
 
 
-def insert_to_chain(chain_obj: BaseChain, blk: BamiBlock, personal_chain: bool = True):
-    block_links = blk.links if not personal_chain else blk.previous
-    block_seq_num = blk.com_seq_num if not personal_chain else blk.sequence_number
-    yield chain_obj.add_block(block_links, block_seq_num, blk.hash)
+def insert_to_chain(chain_obj: BaseChain, blk: Transaction):
+    block_links = blk.chain_links
+    block_seq_num = blk.seq_num
+    yield chain_obj.add_transaction(block_links, block_seq_num, blk.short_hash)
 
 
 def insert_to_chain_or_blk_store(
-    chain_obj: Union[BaseChain, BaseDB], blk: BamiBlock, personal_chain: bool = True,
+    chain_obj: Union[BaseChain, BaseDB], blk: Transaction,
 ):
     if isinstance(chain_obj, BaseChain):
-        yield from insert_to_chain(chain_obj, blk, personal_chain)
+        yield from insert_to_chain(chain_obj, blk)
     else:
-        yield chain_obj.add_block(blk.pack(), blk)
+        yield chain_obj.add_transaction(blk, blk.pack())
 
 
 def insert_batch_seq(
-    chain_obj: Union[BaseChain, BaseDB],
-    batch: List[BamiBlock],
-    personal_chain: bool = False,
+    chain_obj: Union[BaseChain, BaseDB], batch: List[Transaction],
 ) -> None:
     for blk in batch:
-        yield from insert_to_chain_or_blk_store(chain_obj, blk, personal_chain)
+        yield from insert_to_chain_or_blk_store(chain_obj, blk)
 
 
 def insert_batch_reversed(
-    chain_obj: Union[BaseChain, BaseDB],
-    batch: List[BamiBlock],
-    personal_chain: bool = False,
+    chain_obj: Union[BaseChain, BaseDB], batch: List[Transaction],
 ) -> None:
     for blk in reversed(batch):
-        yield from insert_to_chain_or_blk_store(chain_obj, blk, personal_chain)
+        yield from insert_to_chain_or_blk_store(chain_obj, blk)
 
 
 def insert_batch_random(
-    chain_obj: Union[BaseChain, BaseDB],
-    batch: List[BamiBlock],
-    personal_chain: bool = False,
+    chain_obj: Union[BaseChain, BaseDB], batch: List[Transaction],
 ) -> None:
     from random import shuffle
 
     shuffle(batch)
     for blk in batch:
-        yield from insert_to_chain_or_blk_store(chain_obj, blk, personal_chain)
+        yield from insert_to_chain_or_blk_store(chain_obj, blk)
 
 
 batch_insert_functions = [insert_batch_seq, insert_batch_random, insert_batch_reversed]
@@ -188,17 +145,27 @@ def chain():
 
 insert_function_copy = insert_function
 
-_DirsNodes = collections.namedtuple("DirNodes", ("dirs", "nodes"))
+_DirsNodes = collections.namedtuple("DirNodes", ("block_dirs", "peers_dirs", "nodes"))
 
 
 def _set_vals_init(tmpdir_factory, overlay_class, num_nodes) -> _DirsNodes:
-    dirs = [
-        tmpdir_factory.mktemp(str(overlay_class.__name__), numbered=True)
+    block_dirs = [
+        tmpdir_factory.mktemp(str(overlay_class.__name__) + "_block", numbered=True)
         for _ in range(num_nodes)
     ]
-    nodes = create_and_connect_nodes(num_nodes, work_dirs=dirs, ov_class=overlay_class)
+    peer_dirs = [
+        tmpdir_factory.mktemp(str(overlay_class.__name__) + "_peers", numbered=True)
+        for _ in range(num_nodes)
+    ]
 
-    return _DirsNodes(dirs, nodes)
+    nodes = create_and_connect_nodes(
+        num_nodes,
+        block_dirs=block_dirs,
+        peer_store_dirs=peer_dirs,
+        ov_class=overlay_class,
+    )
+
+    return _DirsNodes(block_dirs, peer_dirs, nodes)
 
 
 def _set_vals_teardown(dirs) -> None:
@@ -206,36 +173,42 @@ def _set_vals_teardown(dirs) -> None:
         k.remove(ignore_errors=True)
 
 
-def _init_nodes(nodes, community_id) -> None:
+def _init_nodes(nodes, community_id: bytes) -> None:
     for node in nodes:
-        node.overlay.subscribe_to_subcom(community_id)
+        node.overlay.subscribe_to_conflict_set(community_id)
 
 
 @pytest.fixture
 async def set_vals_by_key(
-    tmpdir_factory, overlay_class, num_nodes: int, init_nodes: bool
+    tmpdir_factory,
+    overlay_class,
+    num_nodes: int,
+    init_nodes: bool,
+    community_id: Optional[bytes] = b"test_state" * 2,
 ):
-    dirs, nodes = _set_vals_init(tmpdir_factory, overlay_class, num_nodes)
+    b_dirs, p_dirs, nodes = _set_vals_init(tmpdir_factory, overlay_class, num_nodes)
     # Make sure every node has a community to listen to
-    community_key = default_eccrypto.generate_key("curve25519").pub()
-    community_id = community_key.key_to_bin()
+    if not community_id:
+        community_key = default_eccrypto.generate_key("curve25519").pub()
+        community_id = community_key.key_to_bin()
     if init_nodes:
         _init_nodes(nodes, community_id)
     yield SetupValues(nodes=nodes, community_id=community_id)
     await unload_nodes(nodes)
-    _set_vals_teardown(dirs)
+    _set_vals_teardown(b_dirs)
+    _set_vals_teardown(p_dirs)
 
 
 @pytest.fixture
 async def set_vals_by_nodes(
     tmpdir_factory, overlay_class, num_nodes: int, init_nodes: bool
 ):
-    dirs, nodes = _set_vals_init(tmpdir_factory, overlay_class, num_nodes)
+    b_dirs, p_dirs, nodes = _set_vals_init(tmpdir_factory, overlay_class, num_nodes)
     # Make sure every node has a community to listen to
-    community_id = nodes[0].overlay.my_pub_key_bin
-    context = nodes[0].overlay.state_db.context
+    community_id = nodes[0].overlay.my_peer.mid
     if init_nodes:
         _init_nodes(nodes, community_id)
-    yield SetupValues(nodes=nodes, community_id=community_id, context=context)
+    yield SetupValues(nodes=nodes, community_id=community_id)
     await unload_nodes(nodes)
-    _set_vals_teardown(dirs)
+    _set_vals_teardown(b_dirs)
+    _set_vals_teardown(p_dirs)

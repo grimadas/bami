@@ -1,7 +1,7 @@
 from copy import copy
 
 import pytest
-from bami.backbone.datastore.frontiers import Frontier, FrontierDiff
+from bami.datastore.frontiers import Frontier, FrontierDiff
 from bami.backbone.utils import Links, Ranges
 
 

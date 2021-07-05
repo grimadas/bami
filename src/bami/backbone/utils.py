@@ -1,9 +1,12 @@
 from binascii import hexlify
 from hashlib import sha256
 from itertools import chain
-from typing import Any, Callable, NewType, Set, Tuple
+import logging
+from typing import Any, Callable, List, NewType, Set, Tuple
 
+from bami.sync.data_models import Link
 from msgpack import dumps, loads
+import numpy as np
 
 KEY_LEN = 8
 ShortKey = NewType("ShortKey", bytes)
@@ -13,12 +16,17 @@ Links = NewType("Links", Tuple[Tuple[int, ShortKey]])
 Ranges = NewType("Ranges", Tuple[Tuple[int, int]])
 StateVote = NewType("StateVote", Tuple[bytes, bytes, bytes])
 
-GENESIS_HASH = b"0" * 32  # ID of the first block of the chain.
+PackableCells = NewType("PackableCells", Tuple[int, List[int]])
+CellsArray = NewType("CellsArray", np.ndarray)
+
+
+GENESIS_HASH = b"0" * 32  # ID of the first tx of the chain.
 GENESIS_SEQ = 1
 UNKNOWN_SEQ = 0
 EMPTY_SIG = b"0" * 64
 EMPTY_PK = b"0" * 74
 ANY_COUNTERPARTY_PK = EMPTY_PK
+
 
 AUDIT_TYPE = b"audit"
 CONFIRM_TYPE = b"confirm"
@@ -31,6 +39,8 @@ def shorten(key: bytes) -> ShortKey:
 
 GENESIS_DOT = Dot((GENESIS_SEQ - 1, shorten(GENESIS_HASH)))
 GENESIS_LINK = Links(((GENESIS_SEQ - 1, shorten(GENESIS_HASH)),))
+GEN_LINK = Link(0, shorten(GENESIS_HASH))
+GEN_DOT = (0, shorten(GENESIS_HASH))
 
 
 def hex_to_int(hex_val) -> int:
@@ -80,21 +90,21 @@ def decode_raw(byte_raw: bytes) -> Any:
 
 
 def encode_links(link_val: Links) -> BytesLinks:
-    """Encode to the sendable packet
+    """Encode to the sendable payload_cls
     Args:
         link_val:
 
     Returns:
-        links encoded in bytes
+        creator_state encoded in bytes
     """
     return BytesLinks(encode_raw(link_val))
 
 
 def decode_links(bytes_links: BytesLinks) -> Links:
-    """Decode bytes to links
+    """Decode bytes to creator_state
 
     Args:
-        bytes_links: bytes containing links value
+        bytes_links: bytes containing creator_state delta
 
     Returns:
         Links values
@@ -138,6 +148,7 @@ def ranges(nums: Set[int]) -> Ranges:
 class Notifier(object):
     def __init__(self):
         self.observers = {}
+        self.logger = logging.getLogger("Notifier")
 
     def add_unique_observer(self, subject: Any, callback: Callable) -> None:
         self.observers[subject] = [callback]

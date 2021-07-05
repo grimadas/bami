@@ -1,113 +1,144 @@
-from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
+from dataclasses import _get_field
+import typing
+from typing import Type
+
+from ipv8.messaging.lazy_payload import VariablePayload
+from ipv8.messaging.serialization import default_serializer, Serializable
 
 
-class ComparablePayload(VariablePayload):
-    def __eq__(self, o: VariablePayload) -> bool:
-        return self.format_list == o.format_list and self.names == o.names
+def get_cls_fields(cls):
+    cls_annotations = cls.__dict__.get("__annotations__", {})
+
+    # Now find fields in our class.  While doing so, validate some
+    # things, and set the default values (as class attributes) where
+    # we can.
+    cls_fields = [_get_field(cls, name, type) for name, type in cls_annotations.items()]
+    return {f.name: f.type for f in cls_fields}
 
 
-@vp_compile
-class RawBlockPayload(ComparablePayload):
+MAX_PACKET_SIZE = 1400
+
+
+def check_size_limit(pack):
+    if len(pack) > MAX_PACKET_SIZE:
+        return False
+    return True
+
+
+class PayloadsManager(object):
     msg_id = 1
-    format_list = ["varlenH"]
-    names = ["block_bytes"]
+    payloads = {}
+
+    @classmethod
+    def enrich(cls, payload_cls: Type[Serializable]) -> Type[Serializable]:
+        name = payload_cls.__name__
+        if name not in cls.payloads:
+            cls.msg_id += 1
+            cls.payloads[name] = cls.msg_id
+        payload_cls.msg_id = cls.payloads[name]
+        return payload_cls
 
 
-@vp_compile
-class BlockPayload(ComparablePayload):
-    msg_id = 2
-    format_list = [
-        "varlenI",
-        "varlenI",
-        "74s",
-        "I",
-        "varlenI",
-        "varlenI",
-        "varlenI",
-        "74s",
-        "I",
-        "64s",
-        "Q",
-    ]
-    names = [
-        "type",
-        "transaction",
-        "public_key",
-        "sequence_number",
-        "previous",
-        "links",
-        "com_prefix",
-        "com_id",
-        "com_seq_num",
-        "signature",
-        "timestamp",
-    ]
+class ImpSer(Serializable):
+    def to_pack_list(self) -> typing.List[tuple]:
+        pass
+
+    @classmethod
+    def from_unpack_list(cls, *args) -> Serializable:
+        pass
 
 
-@vp_compile
-class RawBlockBroadcastPayload(ComparablePayload):
-    msg_id = 3
-    format_list = ["varlenH", "I"]
-    names = ["block_bytes", "ttl"]
+class BamiPayload:
+    serializer = default_serializer
+
+    @staticmethod
+    def _type_map(t: Type) -> str:
+        if t == int:
+            return "Q"
+        elif t == bytes:
+            return "varlenH"
+        elif "Tuple" in str(t) or "List" in str(t) or "Set" in str(t):
+            return (
+                "varlenH-list"
+                if "int" in str(t) or "bytes" in str(t)
+                else [typing.get_args(t)[0]]
+            )
+        elif hasattr(t, "format_list"):
+            return t
+        else:
+            raise NotImplementedError(t, " unknown")
+
+    @classmethod
+    def init_class(cls):
+        # Copy all methods of VariablePayload except init
+        d = {
+            k: v
+            for k, v in VariablePayload.__dict__.items()
+            if not str(k).startswith("__")
+            and str(k) != "names"
+            and str(k) != "format_list"
+        }
+
+        for (name, method) in d.items():
+            setattr(cls, name, method)
+        # Populate names and format list
+        fields = get_cls_fields(cls)
+
+        for f, t in fields.items():
+            cls.names.append(f)
+            cls.format_list.append(cls._type_map(t))
+        return cls
+
+    def is_optimal_size(self):
+        return check_size_limit(self.to_bytes())
+
+    def to_bytes(self) -> bytes:
+        return self.serializer.pack_serializable(self)
+
+    @classmethod
+    def from_bytes(cls, pack: bytes) -> "BamiPayload":
+        return cls.serializer.unpack_serializable(cls, pack)[0]
 
 
-@vp_compile
-class BlockBroadcastPayload(BlockPayload):
-    """
-    Payload for a message that contains a half block and a TTL field for broadcasts.
-    """
+def payload(cls):
+    d = {k: v for k, v in BamiPayload.__dict__.items() if not str(k).startswith("__")}
+    for k, v in d.items():
+        setattr(cls, k, v)
+    cls.names = list()
+    cls.format_list = list()
 
-    msg_id = 4
-    format_list = BlockPayload.format_list + ["I"]
-    names = BlockPayload.names + ["ttl"]
+    # Populate all by mro
+    added_classes = set()
+    new_mro = []
+    has_imp_ser = False
 
+    for superclass in cls.__mro__:
+        if superclass == ImpSer:
+            has_imp_ser = True
+        if hasattr(superclass, "names"):
+            cls.names.extend(superclass.names)
+            cls.format_list.extend(superclass.format_list)
 
-@vp_compile
-class FrontierPayload(ComparablePayload):
-    msg_id = 5
-    format_list = ["varlenH", "varlenH"]
-    names = ["chain_id", "frontier"]
+    new_mro.append(ImpSer)
+    if ImpSer not in added_classes:
+        added_classes.add(ImpSer)
 
+    if not has_imp_ser:
+        new_vals = tuple([ImpSer] + list(cls.__bases__))
+        new_cls = type(cls.__name__, new_vals, dict(cls.__dict__))
+    else:
+        new_cls = cls
 
-@vp_compile
-class ExtendedFrontierPayload(ComparablePayload):
-    msg_id = 6
-    format_list = ["varlenH", "varlenH", "74s", "64s", "varlenH"]
-    names = ["chain_id", "frontier", "pub_key", "signature", "state_blob"]
-
-
-@vp_compile
-class SubscriptionsPayload(ComparablePayload):
-    """
-    Payload that contains a list of all communities that a specific peer is part of.
-    """
-
-    msg_id = 7
-    format_list = ["74s", "varlenH"]
-    names = ["public_key", "subcoms"]
+    return new_cls.init_class()
 
 
-@vp_compile
-class BlocksRequestPayload(ComparablePayload):
-    msg_id = 8
-    format_list = ["varlenH", "varlenH"]
-    names = ["subcom_id", "frontier_diff"]
+def msg_payload(cls):
+    return PayloadsManager.enrich(payload(cls))
 
 
-class StateRequestPayload(ComparablePayload):
-    msg_id = 9
-    format_list = ["varlenH", "varlenH"]
-    names = ["chain_id", "state_request"]
+def enrich(cls):
+    return PayloadsManager.enrich(cls)
 
 
-class StateResponsePayload(ComparablePayload):
-    msg_id = 10
-    format_list = ["varlenH", "varlenH"]
-    names = ["subcom_id", "frontier_diff"]
-
-
-@vp_compile
-class FrontierResponsePayload(ComparablePayload):
-    msg_id = 11
-    format_list = ["varlenH", "varlenH"]
-    names = ["chain_id", "frontier"]
+class MaxPacketException(Exception):
+    pass

@@ -1,118 +1,103 @@
 from typing import Iterator, Optional, Iterable, Set, Tuple
 
-from bami.backbone.block import BamiBlock
-from bami.backbone.datastore.block_store import BaseBlockStore
-from bami.backbone.datastore.chain_store import (
-    BaseChain,
-    FrontierDiff,
-    Frontier,
-    BaseChainFactory,
-)
-from bami.backbone.datastore.database import BaseDB
-from bami.backbone.utils import Dot, Links, ShortKey
+from bami.backbone.transaction import Transaction
+from bami.datastore.block_store import BaseBlockStore
+from bami.datastore.chain_store import BaseChain, BaseChainFactory
+from bami.datastore.database import BaseDB
+from bami.backbone.utils import CellsArray, Dot, Links, ShortKey
+from bami.datastore.frontiers import Frontier, FrontierDiff
+from bami.datastore.peer_store import BasePeerStore, PeerStatus
+from bami.sync.data_models import CellState, PeerState
+import numpy as np
 
 
 class MockBlockStore(BaseBlockStore):
-    def iterate_blocks(self) -> Iterator[Tuple[bytes, bytes]]:
-        return []
-
-    def add_extra(self, block_hash: bytes, extra: bytes) -> None:
+    def get_cells_state(self, state_id: bytes) -> CellState:
         pass
 
-    def get_extra(self, block_hash: bytes) -> Optional[bytes]:
+    def add_transaction(self, tx: Transaction, tx_blob: bytes) -> None:
         pass
 
-    def close(self) -> None:
+    def get_transaction_by_hash(self, tx_hash: int) -> Optional[bytes]:
         pass
 
-    def add_block(self, block_hash: bytes, block_blob: bytes) -> None:
+    def get_peer_state(self, state_id: bytes) -> PeerState:
         pass
 
-    def get_block_by_hash(self, block_hash: bytes) -> Optional[bytes]:
+    def store_peer_state(self, state_id: bytes, new_peer_state: PeerState) -> None:
         pass
 
-    def add_tx(self, block_hash: bytes, tx_blob: bytes) -> None:
+    def update_peer_state(self, state_id: bytes, tx_hash: int) -> None:
         pass
 
-    def add_dot(self, dot: bytes, block_hash: bytes) -> None:
-        pass
-
-    def get_hash_by_dot(self, dot: bytes) -> Optional[bytes]:
-        pass
-
-    def get_tx_by_hash(self, block_hash: bytes) -> Optional[bytes]:
-        pass
-
-
-class MockDBManager(BaseDB):
-    def get_last_reconcile_point(self, chain_id: bytes, peer_id: bytes) -> int:
-        pass
-
-    def set_last_reconcile_point(
-        self, chain_id: bytes, peer_id: bytes, last_point: int
-    ) -> None:
-        pass
-
-    def get_extra_by_dot(self, chain_id: bytes, block_dot: Dot) -> Optional[bytes]:
-        pass
-
-    def has_block(self, block_hash: bytes) -> bool:
-        return False
-
-    def store_last_frontier(
-        self, chain_id: bytes, peer_id: bytes, frontier: Frontier
-    ) -> None:
-        pass
-
-    def get_last_frontier(self, chain_id: bytes, peer_id: bytes) -> Frontier:
-        pass
-
-    def get_block_blobs_by_frontier_diff(
-        self, chain_id: bytes, frontier_diff: FrontierDiff, vals_to_request: Set
-    ) -> Iterable[bytes]:
+    def get_cells_array(self, state_id: bytes) -> CellsArray:
         pass
 
     def close(self) -> None:
         pass
 
-    @property
-    def chain_factory(self) -> BaseChainFactory:
-        return MockChainFactory()
 
-    @property
-    def block_store(self) -> BaseBlockStore:
-        return MockBlockStore()
-
-    def get_chain(self, chain_id) -> Optional[BaseChain]:
+class MockDBManager(BaseDB, MockBlockStore):
+    def has_transaction(self, tx_hash: int) -> bool:
         pass
 
-    def add_block(self, block: BamiBlock, block_serializer) -> None:
+    def close(self) -> None:
         pass
 
-    def get_block_blob_by_dot(self, chain_id: bytes, block_dot: Dot) -> Optional[bytes]:
+
+class MockPeerStore(BasePeerStore):
+    def update_peer_status(self, peer_mid: bytes, new_peer_status: PeerStatus) -> None:
         pass
 
-    def get_tx_blob_by_dot(self, chain_id: bytes, block_dot: Dot) -> Optional[bytes]:
+    def get_peer_status(self, peer_mid: bytes) -> Optional[PeerStatus]:
+        pass
+
+    def get_peers_by_status(self, status: PeerStatus) -> Iterable[bytes]:
+        pass
+
+    def store_peer_state(self, peer_mid: bytes, peer_state: PeerState) -> None:
+        pass
+
+    def store_inconsistent_state(
+        self, signer_peer: bytes, state_1: bytes, state_2: bytes
+    ) -> None:
+        pass
+
+    def get_last_peer_state(self, peer_mid: bytes, state_id: bytes) -> PeerState:
+        pass
+
+    def get_last_peer_state_diff(self, peer_mid: bytes, state_id: bytes) -> np.ndarray:
+        pass
+
+    def store_peer_state_diff(
+        self, peer_mid: bytes, state_id: bytes, state_diff: np.ndarray
+    ) -> None:
+        pass
+
+    def store_signed_peer_state(
+        self, peer_mid: bytes, state_id: bytes, peer_state: bytes
+    ) -> None:
+        pass
+
+    def get_last_signed_peer_state(self, peer_mid: bytes, state_id: bytes) -> bytes:
+        pass
+
+    def get_peers_by_state_id(self, state_id: bytes) -> Iterable[bytes]:
+        pass
+
+    def add_peer_state_id(self, state_id: bytes, peer_id: bytes) -> None:
         pass
 
 
 class MockChain(BaseChain):
-    @property
-    def terminal(self) -> Links:
-        pass
-
-    def get_all_short_hash_by_seq_num(self, seq_num: int) -> Iterable[ShortKey]:
-        pass
-
-    def get_dots_by_seq_num(self, seq_num: int) -> Iterable[Dot]:
-        pass
-
-    def add_block(
+    def add_transaction(
         self, block_links: Links, block_seq_num: int, block_hash: bytes
-    ) -> Dot:
+    ) -> Iterable[Dot]:
         pass
 
-    def reconcile(self, frontier: Frontier, lrp: int = None) -> FrontierDiff:
+    def reconcile(
+        self, frontier: Frontier, last_reconcile_point: int = None
+    ) -> FrontierDiff:
         pass
 
     @property
@@ -123,10 +108,20 @@ class MockChain(BaseChain):
     def consistent_terminal(self) -> Links:
         pass
 
+    @property
+    def terminal(self) -> Links:
+        pass
+
     def get_next_links(self, block_dot: Dot) -> Optional[Links]:
         pass
 
     def get_prev_links(self, block_dot: Dot) -> Optional[Links]:
+        pass
+
+    def get_dots_by_seq_num(self, seq_num: int) -> Iterable[Dot]:
+        pass
+
+    def get_all_short_hash_by_seq_num(self, seq_num: int) -> Optional[Set[ShortKey]]:
         pass
 
 

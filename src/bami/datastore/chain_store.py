@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
 import threading
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, Iterator, List, Optional, Set, Tuple
 
+from bami.backbone.transaction import Transaction
 import cachetools
 
-from bami.backbone.datastore.frontiers import Frontier, FrontierDiff
 from bami.backbone.utils import (
     Dot,
     expand_ranges,
@@ -16,6 +16,9 @@ from bami.backbone.utils import (
     shorten,
     ShortKey,
 )
+from bami.datastore.frontiers import Frontier, FrontierDiff
+from bami.datastore.causality_engine import CausalEngine
+from bami.sync.data_models import Link
 
 
 def _get_first(set_val):
@@ -24,7 +27,7 @@ def _get_first(set_val):
 
 class BaseChain(ABC):
     @abstractmethod
-    def add_block(
+    def add_transaction(
         self, block_links: Links, block_seq_num: int, block_hash: bytes
     ) -> Iterable[Dot]:
         pass
@@ -74,7 +77,7 @@ class BaseChainFactory(ABC):
         pass
 
 
-class Chain(BaseChain):
+class Chain(BaseChain, CausalEngine):
     def __init__(self, terminal_cache_size=10_000, max_extra_dots=5):
         """DAG-Chain of one community based on in-memory dicts.
 
@@ -83,16 +86,16 @@ class Chain(BaseChain):
         """
         # Internal chain store of short hashes
         self.versions = dict()
-        # Pointers to forward blocks
+        # Pointers to forward transactions
         self.forward_pointers = dict()
-        # Pointers to back blocks
+        # Pointers to back transactions
         self.back_pointers = dict()
 
         # Known data structure inconsistencies
         self.inconsistencies = set()
 
         self.inconsistent_blocks = set()
-        # Unknown blocks in the data structure
+        # Unknown transactions in the data structure
         self.holes = set()
         # Current terminal nodes in the DAG
         self._terminal = Links(((0, shorten(GENESIS_HASH)),))
@@ -102,10 +105,13 @@ class Chain(BaseChain):
         self.max_known_seq_num = 0
         self.max_extra_dots = max_extra_dots
 
-        # Cache to speed up bfs on links
+        # Cache to speed up bfs on creator_state
         self.term_cache = cachetools.LRUCache(terminal_cache_size)
 
-        self.lock = threading.Lock()
+        self.txs = {}
+
+    def __str__(self) -> str:
+        return "🔗 Chain: {}".format(self.frontier)
 
     def get_all_short_hash_by_seq_num(self, seq_num: int) -> Optional[Set[ShortKey]]:
         return self.versions.get(seq_num)
@@ -125,13 +131,13 @@ class Chain(BaseChain):
         return self.const_terminal
 
     def get_next_links(self, dot: Dot) -> Optional[Links]:
-        """Get forward link from the point.
+        """Get forward links from the point.
 
         Args:
             dot: tuple of sequence number and short hash key
 
         Returns:
-            A tuple of links
+            A tuple of creator_state
         """
         val = self.forward_pointers.get(dot)
         return Links(tuple(val)) if val else None
@@ -142,15 +148,15 @@ class Chain(BaseChain):
 
     def _update_holes(self, block_seq_num: int) -> None:
         """Fix known holes, or add any new"""
-        # Check if this block fixes known holes
+        # Check if this tx fixes known holes
         if block_seq_num in self.holes:
             self.holes.remove(block_seq_num)
-        # Check if block introduces new holes
+        # Check if tx introduces new holes
         self.holes.update({i for i in range(self.max_known_seq_num + 1, block_seq_num)})
         self.max_known_seq_num = max(self.max_known_seq_num, block_seq_num)
 
     def _is_block_links_consistent(self, block_links: Links) -> bool:
-        # Add to inconsistencies any unknown back pointers. If any block is not consistent
+        # Add to inconsistencies any unknown back pointers. If any tx is not consistent
         return all(
             (dot == GENESIS_DOT or self.get_prev_links(dot) is not None)
             and dot not in self.inconsistent_blocks
@@ -182,9 +188,9 @@ class Chain(BaseChain):
     def _add_inconsistencies(self, block_links: Links, block_dot: Dot) -> bool:
         """Fix any inconsistencies in the data structure, and verify any new"""
 
-        # Check if block introduces new inconsistencies
+        # Check if tx introduces new inconsistencies
         is_block_consistent = True
-        # Add to inconsistencies any unknown back pointers. If any block is not consistent
+        # Add to inconsistencies any unknown back pointers. If any tx is not consistent
         for dot in block_links:
             if dot != GENESIS_DOT and not self.get_prev_links(dot):
                 self.inconsistencies.add(dot)
@@ -202,7 +208,7 @@ class Chain(BaseChain):
     def _remove_inconsistencies(
         self, block_dot: Dot, is_block_consistent: bool
     ) -> Iterable[Dot]:
-        # Check if block fixes some inconsistencies
+        # Check if tx fixes some inconsistencies
         if block_dot in self.inconsistencies:
             self.inconsistencies.remove(block_dot)
             # Block might fixed some inconsistencies
@@ -215,14 +221,14 @@ class Chain(BaseChain):
     def __calc_terminal(
         self, current: Links, make_consistent_step: bool = False
     ) -> Set[Tuple[int, ShortKey]]:
-        """Recursive iteration through the block links"""
+        """Recursive iteration through the tx creator_state"""
         terminal = set()
         for blk_link in current:
             if blk_link not in self.forward_pointers:
                 # Terminal nodes achieved
                 terminal.add(blk_link)
             else:
-                # Next blocks are available, check if there is cache
+                # Next transactions are available, check if there is cache
                 cached_next = self.term_cache.get(blk_link, default=None)
                 if cached_next:
                     # Cached next exits
@@ -267,11 +273,11 @@ class Chain(BaseChain):
         block_short_hash: ShortKey,
         consistent_update: bool = True,
     ) -> None:
-        """Update current terminal nodes wrt new block"""
+        """Update current terminal nodes wrt new tx"""
 
         # Check if the terminal nodes changed
         current_links = Links(((block_seq_num, block_short_hash),))
-        # Start traversal from the block
+        # Start traversal from the tx
         new_term = self.__calc_terminal(current_links)
         # Traversal from the current terminal nodes. Block can change the current terminal
 
@@ -301,35 +307,34 @@ class Chain(BaseChain):
             self.versions[block_seq_num] = set()
         self.versions[block_seq_num].add(block_hash)
 
-    def add_block(
-        self, block_links: Links, block_seq_num: int, block_hash: bytes
+    def add_transaction(
+        self, block_links: Tuple[Link], block_seq_num: int, block_hash: bytes
     ) -> List[Dot]:
         blk_hash = shorten(block_hash)
         block_dot = Dot((block_seq_num, blk_hash))
+        block_links = tuple((bl.tx_index, bl.tx_hash) for bl in block_links)
 
-        with self.lock:
-            # 0. Update versions
-            self._update_versions(block_seq_num, blk_hash)
-            # 1. Update back pointers
-            self._update_back_pointers(block_dot, block_links)
-            # 2. Update forward pointers
-            self._update_forward_pointers(block_links, block_dot)
-            # 3. Update holes
-            self._update_holes(block_seq_num)
-            # 4. Update inconsistencies
-            block_consistent = self._add_inconsistencies(block_links, block_dot)
-            missing = list(self._remove_inconsistencies(block_dot, block_consistent))
-            if missing:
-                last_dot = missing[-1]
-                for dot in missing[:-1]:
-                    self.term_cache[Links((dot,))] = (Links((last_dot,)), True)
-            # 5. Update terminal nodes if consistent
-            old_terminal = self.const_terminal
-            self._update_terminal(block_seq_num, blk_hash, block_consistent)
+        # 0. Update versions
+        self._update_versions(block_seq_num, blk_hash)
+        # 1. Update back pointers
+        self._update_back_pointers(block_dot, block_links)
+        # 2. Update forward pointers
+        self._update_forward_pointers(block_links, block_dot)
+        # 3. Update holes
+        self._update_holes(block_seq_num)
+        # 4. Update inconsistencies
+        block_consistent = self._add_inconsistencies(block_links, block_dot)
+        missing = list(self._remove_inconsistencies(block_dot, block_consistent))
+        if missing:
+            last_dot = missing[-1]
+            for dot in missing[:-1]:
+                self.term_cache[Links((dot,))] = (Links((last_dot,)), True)
+        # 5. Update terminal nodes if consistent
+        old_terminal = self.const_terminal
+        self._update_terminal(block_seq_num, blk_hash, block_consistent)
 
         diff = set(self.consistent_terminal) - set(old_terminal)
         if diff and missing:
-            # return list(itertools.chain([max(diff)], missing))
             return missing
         elif missing:
             return missing
@@ -338,14 +343,21 @@ class Chain(BaseChain):
         else:
             return []
 
+    def add_tx(self, tx: Transaction) -> Iterable[Transaction]:
+        tx_dot = tx.dot
+        self.txs[tx_dot] = tx
+        tx_dots = self.add_transaction(
+            tx.chain_links, tx.seq_num, tx.short_hash
+        )
+        return (self.txs[t] for t in tx_dots)
+
     @property
-    def frontier(self) -> Frontier:
-        with self.lock:
-            return Frontier(
-                self.terminal,
-                ranges(self.holes),
-                Links(tuple(sorted(self.inconsistencies))),
-            )
+    def frontier(self) -> "Frontier":
+        return Frontier(
+            self.terminal,
+            ranges(self.holes),
+            Links(tuple(sorted(self.inconsistencies))),
+        )
 
     def reconcile(
         self, frontier: Frontier, last_reconcile_point: int = None
@@ -359,11 +371,11 @@ class Chain(BaseChain):
             expand_ranges(Ranges(((1, self.max_known_seq_num),))) - self.holes
         )
 
-        # External frontier has blocks that peer is missing => Request from front these blocks
+        # External frontier has transactions that peer is missing => Request from front these transactions
         f_diff = front_known_seq - peer_known_seq
         missing = ranges(f_diff)
 
-        # Front has blocks with conflicting hash => Request these blocks
+        # Front has transactions with conflicting hash => Request these transactions
         conflicts = {
             (s, h)
             for s, h in frontier.terminal
@@ -373,7 +385,7 @@ class Chain(BaseChain):
             and s not in frontier.holes
         }
 
-        # Check if peer has block that cover your inconsistencies
+        # Check if peer has tx that cover your inconsistencies
         for i in self.inconsistencies:
             for t in self.__calc_terminal(Links((i,))):
                 if (

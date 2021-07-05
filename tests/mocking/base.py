@@ -5,8 +5,10 @@ from ipv8.test.mocking.endpoint import internet
 from ipv8.test.mocking.ipv8 import MockIPv8
 
 
-def create_node(overlay_class, work_dir=".", **kwargs):
-    ipv8 = MockIPv8("curve25519", overlay_class, work_dir=work_dir, **kwargs)
+def create_node(overlay_class, block_dir=".blocks", peer_dir=".peers", **kwargs):
+    ipv8 = MockIPv8(
+        "curve25519", overlay_class, work_dirs=(block_dir, peer_dir), **kwargs
+    )
     ipv8.overlay.ipv8 = ipv8
     return ipv8
 
@@ -20,12 +22,15 @@ def connect_nodes(nodes, overlay_class):
             private_peer = other.my_peer
             public_peer = Peer(private_peer.public_key, private_peer.address)
             node.network.add_verified_peer(public_peer)
-            node.network.discover_services(public_peer, [overlay_class.master_peer.mid])
+            node.network.discover_services(public_peer, [overlay_class.community_id])
 
 
-def create_and_connect_nodes(num_nodes, work_dirs, ov_class):
+def create_and_connect_nodes(num_nodes, block_dirs, peer_store_dirs, ov_class):
     nodes = [
-        create_node(ov_class, work_dir=str(work_dirs[i])) for i in range(num_nodes)
+        create_node(
+            ov_class, block_dir=str(block_dirs[i]), peer_dir=str(peer_store_dirs[i])
+        )
+        for i in range(num_nodes)
     ]
     connect_nodes(nodes, ov_class)
     return nodes
@@ -33,7 +38,7 @@ def create_and_connect_nodes(num_nodes, work_dirs, ov_class):
 
 async def unload_nodes(nodes):
     for node in nodes:
-        await node.unload()
+        await node.stop()
     internet.clear()
 
 

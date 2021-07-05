@@ -1,0 +1,2 @@
+class DesynchronizedBloomFiltersException(Exception):
+    pass

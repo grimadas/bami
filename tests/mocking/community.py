@@ -1,33 +1,47 @@
-from asyncio.queues import Queue
+from abc import ABCMeta
 from typing import Any, Dict, Iterable, Optional, Type, Union
 
-from bami.backbone.block import BamiBlock
-from bami.backbone.blockresponse import BlockResponseMixin, BlockResponse
 from bami.backbone.community import BamiCommunity
 from bami.backbone.community_routines import (
     CommunityRoutines,
     MessageStateMachine,
 )
-from bami.backbone.datastore.database import BaseDB
 from bami.backbone.discovery import SubCommunityDiscoveryStrategy
 from bami.backbone.settings import BamiSettings
-from bami.backbone.sub_community import (
-    BaseSubCommunity,
-    BaseSubCommunityFactory,
-    IPv8SubCommunityFactory,
-    LightSubCommunityFactory,
+from bami.conflicts.conflict_set import (
+    BaseConflictSet,
+    BaseConflictSetFactory,
+    IPv8ConflictSetFactory,
+    LightConflictSetFactory,
     SubCommunityRoutines,
 )
+from bami.datastore.database import BaseDB
 from ipv8.community import Community
 from ipv8.keyvault.crypto import default_eccrypto
 from ipv8.keyvault.keys import Key
-from ipv8.peer import Peer
+from ipv8.messaging.payload import Payload
+from ipv8.peer import Address, Peer
 from ipv8.requestcache import RequestCache
 
 from tests.mocking.mock_db import MockDBManager
 
 
 class FakeRoutines(CommunityRoutines):
+    def send_packet(self, address: Address, packet: bytes) -> None:
+        pass
+
+    def prepare_packet(self, payload: Payload, sig: bool = True) -> bytes:
+        pass
+
+    def share_in_community(
+        self,
+        packet: Union[bytes, Payload],
+        subcom_id: bytes = None,
+        fanout: int = None,
+        seed: int = None,
+    ) -> None:
+        pass
+
     @property
     def request_cache(self) -> RequestCache:
         pass
@@ -52,7 +66,7 @@ class FakeRoutines(CommunityRoutines):
     def my_pub_key(self) -> bytes:
         return self.key.pub().key_to_bin()
 
-    def send_packet(self, peer: Peer, packet: Any) -> None:
+    def send_payload(self, peer: Peer, payload: Any) -> None:
         pass
 
     @property
@@ -60,7 +74,7 @@ class FakeRoutines(CommunityRoutines):
         return MockDBManager()
 
 
-class MockSubCommuntiy(BaseSubCommunity):
+class MockSubCommuntiy(BaseConflictSet):
     async def unload(self):
         pass
 
@@ -68,7 +82,7 @@ class MockSubCommuntiy(BaseSubCommunity):
         pass
 
     @property
-    def subcom_id(self) -> bytes:
+    def cs_id(self) -> bytes:
         pass
 
     def get_known_peers(self) -> Iterable[Peer]:
@@ -78,43 +92,43 @@ class MockSubCommuntiy(BaseSubCommunity):
 class MockSubCommunityDiscoveryStrategy(SubCommunityDiscoveryStrategy):
     def discover(
         self,
-        subcom: BaseSubCommunity,
+        subcom: BaseConflictSet,
         target_peers: int = 20,
         discovery_params: Dict[str, Any] = None,
     ) -> None:
         pass
 
 
-class MockSubCommunityFactory(BaseSubCommunityFactory):
-    def create_subcom(self, *args, **kwargs) -> BaseSubCommunity:
+class MockConflictSetFactory(BaseConflictSetFactory):
+    def create_conflict_set(self, *args, **kwargs) -> BaseConflictSet:
         return MockSubCommuntiy()
 
 
 class MockSubCommunityRoutines(SubCommunityRoutines):
-    def discovered_peers_by_subcom(self, subcom_id) -> Iterable[Peer]:
+    def discovered_peers_by_conflict_set(self, subcom_id) -> Iterable[Peer]:
         pass
 
-    def get_subcom(self, sub_com: bytes) -> Optional[BaseSubCommunity]:
-        pass
-
-    @property
-    def my_subcoms(self) -> Iterable[bytes]:
-        pass
-
-    def add_subcom(self, sub_com: bytes, subcom_obj: BaseSubCommunity) -> None:
-        pass
-
-    def notify_peers_on_new_subcoms(self) -> None:
-        pass
-
-    def on_join_subcommunity(self, sub_com_id: bytes) -> None:
+    def get_conflict_set(self, sub_com: bytes) -> Optional[BaseConflictSet]:
         pass
 
     @property
-    def subcom_factory(
+    def my_conflict_sets(self) -> Iterable[bytes]:
+        pass
+
+    def add_conflict_set(self, sub_com: bytes, subcom_obj: BaseConflictSet) -> None:
+        pass
+
+    def notify_peers_on_new_conflict_set(self) -> None:
+        pass
+
+    def on_join_cs(self, cs_id: bytes) -> None:
+        pass
+
+    @property
+    def cs_factory(
         self,
-    ) -> Union[BaseSubCommunityFactory, Type[BaseSubCommunityFactory]]:
-        return MockSubCommunityFactory()
+    ) -> Union[BaseConflictSetFactory, Type[BaseConflictSetFactory]]:
+        return MockConflictSetFactory()
 
 
 class MockSettings(object):
@@ -128,11 +142,23 @@ class MockSettings(object):
 
 
 class MockedCommunity(Community, CommunityRoutines):
-    master_peer = Peer(default_eccrypto.generate_key(u"very-low"))
+    def send_packet(self, address: Address, packet: bytes) -> None:
+        return BamiCommunity.send_packet(self, address, packet)
+
+    def share_in_community(
+        self,
+        packet: Union[bytes, Payload],
+        subcom_id: bytes = None,
+        fanout: int = None,
+        seed: int = None,
+    ) -> None:
+        return BamiCommunity.share_in_community(self, packet, subcom_id, fanout, seed)
+
+    community_id = Peer(default_eccrypto.generate_key(u"very-low")).mid
 
     def __init__(self, *args, **kwargs):
-        if kwargs.get("work_dir"):
-            self.work_dir = kwargs.pop("work_dir")
+        if kwargs.get("work_dirs"):
+            self.work_dirs = kwargs.pop("work_dirs")
         super().__init__(*args, **kwargs)
         self._req = RequestCache()
 
@@ -148,8 +174,11 @@ class MockedCommunity(Community, CommunityRoutines):
     def settings(self) -> Any:
         return MockSettings()
 
-    def send_packet(self, *args, **kwargs) -> None:
+    def send_payload(self, *args, **kwargs) -> None:
         self.ez_send(*args, **kwargs)
+
+    def prepare_packet(self, payload: Payload, sig: bool = True) -> bytes:
+        return self.ezr_pack(payload.msg_id, payload, sig=sig)
 
     @property
     def request_cache(self) -> RequestCache:
@@ -160,34 +189,13 @@ class MockedCommunity(Community, CommunityRoutines):
         return await super().unload()
 
 
-class FakeBackCommunity(BamiCommunity, BlockResponseMixin):
-    def incoming_frontier_queue(self, subcom_id: bytes) -> Queue:
-        pass
-
-    def create_subcom(self, *args, **kwargs) -> BaseSubCommunity:
-        pass
-
-    def apply_confirm_tx(self, block: BamiBlock, confirm_tx: Dict) -> None:
-        pass
-
-    def apply_reject_tx(self, block: BamiBlock, reject_tx: Dict) -> None:
-        pass
-
-    def block_response(
-        self, block: BamiBlock, wait_time: float = None, wait_blocks: int = None
-    ) -> BlockResponse:
-        pass
-
-    def process_block_unordered(self, blk: BamiBlock, peer: Peer) -> None:
-        pass
-
-    def received_block_in_order(self, block: BamiBlock) -> None:
-        pass
+class FakeBackCommunity(BamiCommunity, metaclass=ABCMeta):
+    community_id = b"\x00" * 20
 
 
-class FakeIPv8BackCommunity(IPv8SubCommunityFactory, FakeBackCommunity):
+class FakeIPv8BackCommunity(BamiCommunity, IPv8ConflictSetFactory):
     pass
 
 
-class FakeLightBackCommunity(LightSubCommunityFactory, FakeBackCommunity):
+class FakeLightBackCommunity(LightConflictSetFactory, BamiCommunity):
     pass

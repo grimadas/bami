@@ -1,19 +1,18 @@
-from abc import abstractmethod, ABCMeta
-from asyncio import sleep, ensure_future, PriorityQueue
+from abc import ABCMeta, abstractmethod
+from asyncio import ensure_future, PriorityQueue, sleep
 from collections import defaultdict
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict
 
-from bami.backbone.block import BamiBlock
 from bami.backbone.exceptions import InvalidTransactionFormatException
 from bami.backbone.mixins import StatedMixin
+from bami.backbone.transaction import Transaction
 from bami.backbone.utils import (
+    CONFIRM_TYPE,
     decode_raw,
     EMPTY_PK,
     encode_raw,
-    CONFIRM_TYPE,
     REJECT_TYPE,
-    shorten,
 )
 
 
@@ -25,11 +24,11 @@ class BlockResponse(Enum):
 
 class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
     """
-    Adding this mixin class to your overlays enables routines to respond to incoming blocks with another block.
+    Adding this mixin class to your overlays enables routines to respond to incoming transactions with another tx.
     """
 
     def setup_mixin(self) -> None:
-        # Dictionary chain_id: block_dot -> block
+        # Dictionary state_id: tx_dot -> tx
         self.tracked_blocks = defaultdict(lambda: {})
         self.block_sign_queue_task = ensure_future(
             self.evaluate_counter_signing_blocks()
@@ -42,41 +41,44 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
 
     @abstractmethod
     def block_response(
-        self, block: BamiBlock, wait_time: float = None, wait_blocks: int = None
+        self, block: Transaction, wait_time: float = None, wait_blocks: int = None
     ) -> BlockResponse:
         """
-        Respond to block BlockResponse: Reject, Confirm, Delay
+        Respond to tx BlockResponse: Reject, Confirm, Delay
         Args:
             block: to respond to
-            wait_time: time that passed since first block process initiated
-            wait_blocks: number of blocks passed since the block
+            wait_time: time that passed since first tx process initiated
+            wait_blocks: number of transactions passed since the tx
         Returns:
             BlockResponse: Confirm, Reject or Delay
         """
         pass
 
-    def confirm_tx_extra_data(self, block: BamiBlock) -> Dict:
+    def confirm_tx_extra_data(self, block: Transaction) -> Dict:
         """
         Return additional data that should be added to the confirm transaction.
         Args:
-            block: The block that is about to be confirmed.
+            block: The tx that is about to be confirmed.
 
         Returns: A dictionary with values to add to the confirm transaction.
         """
         return {}
 
-    def add_block_to_response_processing(self, block: BamiBlock) -> None:
-        self.counter_signing_block_queue.put_nowait((block.com_seq_num, (0, block)))
+    def add_block_to_response_processing(self, block: Transaction) -> None:
+        self.counter_signing_block_queue.put_nowait((block.seq_nums[0], (0, block)))
 
     def process_counter_signing_block(
-        self, block: BamiBlock, time_passed: float = None, num_block_passed: int = None,
+        self,
+        block: Transaction,
+        time_passed: float = None,
+        num_block_passed: int = None,
     ) -> bool:
         """
-        Process block that should be counter-signed and return True if the block should be delayed more.
+        Process tx that should be counter-signed and return True if the tx should be delayed more.
         Args:
-            block: Processed block
+            block: Processed tx
             time_passed: time passed since first added
-            num_block_passed: number of blocks passed since first added
+            num_block_passed: number of transactions passed since first added
         Returns:
             Should add to queue again.
         """
@@ -96,7 +98,7 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
             process_time, block = block_info
             should_delay = self.process_counter_signing_block(block, process_time)
             self.logger.debug(
-                "Processing counter signing block. Delayed: %s", should_delay
+                "Processing counter signing tx. Delayed: %s", should_delay
             )
             if should_delay:
                 self.counter_signing_block_queue.put_nowait(
@@ -107,17 +109,17 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
                 self.tracked_blocks[block.com_id].pop(block.com_dot, None)
                 await sleep(0.001)
 
-    def confirm(self, block: BamiBlock, extra_data: Dict = None) -> None:
+    def confirm(self, block: Transaction, extra_data: Dict = None) -> None:
         """
-        Confirm the transaction in an incoming block. Link will be in the transaction with block dot.
+        Confirm the transaction in an incoming tx. Link will be in the transaction with tx dot.
         Args:
-            block: The BamiBlock to confirm.
+            block: The Transaction to confirm.
             extra_data: An optional dictionary with extra data that is appended to the confirmation.
         """
-        self.logger.info("Confirming block %s", block)
-        chain_id = block.com_id if block.com_id != EMPTY_PK else block.public_key
+        self.logger.info("Confirming tx %s", block)
+        chain_id = block.com_id if block.com_id != EMPTY_PK else block.creator_id
         dot = block.com_dot if block.com_id != EMPTY_PK else block.pers_dot
-        confirm_tx = {b"initiator": block.public_key, b"dot": dot}
+        confirm_tx = {b"initiator": block.creator_id, b"dot": dot}
         if extra_data:
             confirm_tx.update(extra_data)
         block = self.create_signed_block(
@@ -125,17 +127,17 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
         )
         self.share_in_community(block, chain_id)
 
-    def reject(self, block: BamiBlock, extra_data: Dict = None) -> None:
+    def reject(self, block: Transaction, extra_data: Dict = None) -> None:
         """
-        Reject the transaction in an incoming block.
+        Reject the transaction in an incoming tx.
 
         Args:
-            block: The BamiBlock to reject.
+            block: The Transaction to reject.
             extra_data: Some additional data to append to the reject transaction, e.g., a reason.
         """
-        chain_id = block.com_id if block.com_id != EMPTY_PK else block.public_key
+        chain_id = block.com_id if block.com_id != EMPTY_PK else block.creator_id
         dot = block.com_dot if block.com_id != EMPTY_PK else block.pers_dot
-        reject_tx = {b"initiator": block.public_key, b"dot": dot}
+        reject_tx = {b"initiator": block.creator_id, b"dot": dot}
         if extra_data:
             reject_tx.update(extra_data)
         block = self.create_signed_block(
@@ -150,13 +152,13 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
                 "Invalid confirmation ", claimer, confirm_tx
             )
 
-    def process_confirm(self, block: BamiBlock) -> None:
+    def process_confirm(self, block: Transaction) -> None:
         confirm_tx = decode_raw(block.transaction)
-        self.verify_confirm_tx(block.public_key, confirm_tx)
+        self.verify_confirm_tx(block.creator_id, confirm_tx)
         self.apply_confirm_tx(block, confirm_tx)
 
     @abstractmethod
-    def apply_confirm_tx(self, block: BamiBlock, confirm_tx: Dict) -> None:
+    def apply_confirm_tx(self, block: Transaction, confirm_tx: Dict) -> None:
         pass
 
     def verify_reject_tx(self, rejector: bytes, confirm_tx: Dict) -> None:
@@ -166,11 +168,11 @@ class BlockResponseMixin(StatedMixin, metaclass=ABCMeta):
                 "Invalid reject ", rejector, confirm_tx
             )
 
-    def process_reject(self, block: BamiBlock) -> None:
+    def process_reject(self, block: Transaction) -> None:
         reject_tx = decode_raw(block.transaction)
-        self.verify_reject_tx(block.public_key, reject_tx)
+        self.verify_reject_tx(block.creator_id, reject_tx)
         self.apply_reject_tx(block, reject_tx)
 
     @abstractmethod
-    def apply_reject_tx(self, block: BamiBlock, reject_tx: Dict) -> None:
+    def apply_reject_tx(self, block: Transaction, reject_tx: Dict) -> None:
         pass

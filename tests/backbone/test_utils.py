@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from unittest.mock import Mock
@@ -15,6 +16,7 @@ from bami.backbone.utils import (
     ranges,
     shorten,
 )
+from decimal import Decimal, getcontext
 
 
 @pytest.fixture(
@@ -63,13 +65,16 @@ def test_encode_decode_bytelist():
     assert set(decode_raw(encode_raw(list(vals)))) == vals
 
 
+def test_encode_decode_numpy():
+    val = np.array([99] * 32)
+    v = val.tobytes()
+    assert np.all(np.frombuffer(v, np.int64) == val)
+
+
 def test_encode_decode_links(keys_fixture):
     links = Links(((1, shorten(keys_fixture)),))
     raw_bytes = encode_links(links)
     assert decode_links(raw_bytes) == links
-
-
-from decimal import Decimal, getcontext
 
 
 def test_decimal():
@@ -78,6 +83,6 @@ def test_decimal():
     t = Decimal(2.191, new_con)
     t2 = Decimal(2.11, new_con)
 
-    l = encode_raw({b"value": float(t2)})
+    l = encode_raw({b"delta": float(t2)})
     p = decode_raw(l)
-    assert p.get(b"value") == float(t2)
+    assert p.get(b"delta") == float(t2)

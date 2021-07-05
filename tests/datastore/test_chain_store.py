@@ -1,6 +1,9 @@
+from bami.backbone.transaction import Transaction
+from bami.sync.data_models import Link
+from bami.sync.peer_state import CellIndexer
 import pytest
 
-from bami.backbone.datastore.chain_store import Chain
+from bami.datastore.chain_store import Chain
 from bami.backbone.utils import (
     expand_ranges,
     GENESIS_DOT,
@@ -11,19 +14,18 @@ from bami.backbone.utils import (
     wrap_return,
 )
 
-from tests.conftest import FakeBlock
-
 
 class TestBatchInsert:
-    num_blocks = 1000
+    num_blocks = 10
 
     def test_insert(self, create_batches, insert_function, chain):
         batches = create_batches(num_batches=1, num_blocks=self.num_blocks)
         last_blk = batches[0][-1]
-        last_blk_link = (last_blk.com_seq_num, last_blk.short_hash)
+        last_blk_link = (last_blk.seq_num, last_blk.short_hash)
         wrap_return(insert_function(chain, batches[0]))
-        assert len(chain.terminal) == 1
+
         assert last_blk_link in chain.terminal
+        assert len(chain.terminal) == 1
 
 
 class TestConflictsInsert:
@@ -34,14 +36,14 @@ class TestConflictsInsert:
 
         # Insert first batch sequentially
         last_blk = batches[0][-1]
-        last_blk_link = (last_blk.com_seq_num, last_blk.short_hash)
+        last_blk_link = (last_blk.seq_num, last_blk.short_hash)
         wrap_return(insert_function(chain, batches[0]))
         assert len(chain.terminal) == 1
         assert last_blk_link in chain.terminal
 
         # Insert second batch sequentially
         last_blk = batches[1][-1]
-        last_blk_link = (last_blk.com_seq_num, last_blk.short_hash)
+        last_blk_link = (last_blk.seq_num, last_blk.short_hash)
         wrap_return(insert_function_copy(chain, batches[1]))
         assert len(chain.terminal) == 2
         assert last_blk_link in chain.terminal
@@ -56,7 +58,7 @@ class TestConflictsInsert:
         for batch in batches:
             last_blk = batches[i - 1][-1]
             wrap_return(insert_function(chain, batch))
-            last_blk_link = (last_blk.com_seq_num, last_blk.short_hash)
+            last_blk_link = (last_blk.seq_num, last_blk.short_hash)
             assert len(chain.terminal) == i
             assert last_blk_link in chain.terminal
             i += 1
@@ -88,14 +90,14 @@ class TestFrontiers:
 
         # insert first half
         wrap_return(insert_function(chain, batches[0][:4]))
-        # Skip one block and insert second half
+        # Skip one tx and insert second half
         wrap_return(insert_function(chain, batches[0][5:]))
 
         frontier = chain.frontier
         assert len(frontier.terminal) == 2
         assert frontier.terminal[0][0] == 4 and frontier.terminal[1][0] == 10
 
-        # The frontier should contain one hole range, specifically the block with community sequence number 5
+        # The frontier should contain one hole range, specifically the tx with community sequence number 5
         assert len(frontier.holes) == 1
         assert frontier.holes[0] == (5, 5)
 
@@ -107,14 +109,14 @@ class TestFrontiers:
 
         # insert first half
         wrap_return(insert_function(chain, batches[0][:10]))
-        # Skip 10 blocks
+        # Skip 10 transactions
         wrap_return(insert_function(chain, batches[0][20:]))
 
         frontier = chain.frontier
         assert len(frontier.holes) == 1
         assert frontier.holes[0] == (11, 20)
 
-        # The block with community seq num 20 is missing
+        # The tx with community seq num 20 is missing
         assert len(frontier.inconsistencies) == 1
         assert frontier.inconsistencies[0][0] == 20
 
@@ -126,9 +128,9 @@ class TestFrontiers:
 
         # insert first half
         wrap_return(insert_function(chain, batches[0][:10]))
-        # Skip 5 blocks
+        # Skip 5 transactions
         wrap_return(insert_function(chain, batches[0][15:20]))
-        # Skip more 5 blocks
+        # Skip more 5 transactions
         wrap_return(insert_function(chain, batches[0][25:]))
 
         frontier = chain.frontier
@@ -214,7 +216,7 @@ class TestFrontierReconciliation:
 
         front_diff = chain.reconcile(chain2.frontier)
 
-        # These frontiers are the same and their reconciliation should not result in conflicts or missing blocks
+        # These frontiers are the same and their reconciliation should not result in conflicts or missing transactions
         assert not front_diff.conflicts
         assert not front_diff.missing
 
@@ -363,7 +365,8 @@ class TestNewConsistentDots:
     def test_one_insert(self, create_batches, chain):
         batchs = create_batches(num_batches=1, num_blocks=10)
         blk = batchs[0][0]
-        res = chain.add_block(blk.previous, blk.sequence_number, blk.hash)
+
+        res = chain.add_transaction(blk.chain_links, blk.seq_num, blk.hash)
         assert len(res) == 1
         assert res[0][0] == 1
 
@@ -371,7 +374,7 @@ class TestNewConsistentDots:
         batches = create_batches(num_batches=1, num_blocks=10)
         for i in range(10):
             blk = batches[0][i]
-            res = chain.add_block(blk.links, blk.com_seq_num, blk.hash)
+            res = chain.add_transaction(blk.chain_links, blk.seq_num, blk.hash)
             assert len(res) == 1
             assert res[0][0] == i + 1
 
@@ -411,26 +414,31 @@ class TestNewConsistentDots:
         for i in range(1, 21):
             assert len(list(chain.get_dots_by_seq_num(i))) == 2
 
-    def test_insert_with_merge_block(self, create_batches, insert_function, chain):
+    def test_insert_with_merge_block(
+        self, create_batches, insert_function, chain, test_params
+    ):
         batches = create_batches(num_batches=2, num_blocks=10)
 
         last_blk1 = batches[0][-1]
         last_blk2 = batches[1][-1]
 
-        dot1 = (last_blk1.com_seq_num, last_blk1.short_hash)
-        dot2 = (last_blk2.com_seq_num, last_blk2.short_hash)
+        dot1 = Link(last_blk1.seq_num, last_blk1.short_hash)
+        dot2 = Link(last_blk2.seq_num, last_blk2.short_hash)
 
         vals = wrap_return(insert_function(chain, batches[0]))
         assert len(vals) == 10
         assert vals[0][0] == 1 and vals[-1][0] == 10
+        params = test_params
+        params[2] = (dot1, dot2)
 
-        merge_block = FakeBlock(links=Links((dot1, dot2)))
-        chain.add_block(merge_block.links, merge_block.com_seq_num, merge_block.hash)
+        merge_block = Transaction(*params)
 
+        chain.add_transaction(
+            merge_block.chain_links, merge_block.seq_num, merge_block.short_hash
+        )
         vals = wrap_return(insert_function(chain, batches[1]))
         assert len(vals) == 11
         assert vals[0][0] == 1 and vals[-1][0] == 11
-
         assert len(list(chain.get_dots_by_seq_num(11))) == 1
 
 
